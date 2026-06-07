@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.hh.update</string>
+
+  <!-- Опрос каждые 15 мин. Реальный подъём идёт раз в 4:00–4:30 — частоту регулирует
+       сам скрипт через .state/update_next (рандомный джиттер). НЕЗАВИСИМ от apply/reply:
+       свой lock (/tmp/hh-update.lock), общий /tmp/hh-tool.lock не трогает. -->
+  <key>StartInterval</key>
+  <integer>900</integer>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/yanik/hh-applicant-tool</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/yanik/hh-applicant-tool/run-update-slot.sh</string>
+  </array>
+
+  <!-- launchd даёт минимальный PATH — прописываем явно (poetry). -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/yanik/hh-applicant-tool/logs/update.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/yanik/hh-applicant-tool/logs/update.log</string>
+</dict>
+</plist>

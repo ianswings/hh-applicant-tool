@@ -103,6 +103,10 @@ class Operation(BaseOperation):
         )
 
     def run(self, tool: HHApplicantTool, args: Namespace) -> None:
+        self._setup(tool, args)
+        self.reply_employers()
+
+    def _setup(self, tool: HHApplicantTool, args: Namespace) -> None:
         self.tool = tool
         self.api_client = tool.api_client
         self.resume_id = tool.first_resume_id()
@@ -118,7 +122,51 @@ class Operation(BaseOperation):
         self.period = args.period
 
         logger.debug(f"{self.reply_message = }")
-        self.reply_employers()
+
+    # --- seam-методы (переопределяются в reply_slot.py) ---
+    def _should_reply(self, negotiation, last_message) -> bool:
+        is_employer = (
+            last_message["author"]["participant_type"] == "employer"
+        )
+        return is_employer or not negotiation.get("viewed_by_opponent")
+
+    def _ai_reply_enabled(self) -> bool:
+        return bool(self.cover_letter_ai)
+
+    def _generate_reply(
+        self, negotiation, vacancy, message_history, placeholders, last_message
+    ) -> str:
+        ai_query = (
+            f"Вакансия: {placeholders['vacancy_name']}\n"
+            f"История переписки:\n"
+            + "\n".join(message_history[-10:])
+            + f"\n\nИнструкция: {self.message_prompt}"
+        )
+        return self.cover_letter_ai.complete(ai_query)
+
+    def _send_message(self, nid, message, vacancy) -> bool:
+        """Отправляет сообщение в чат. В dry-run только логирует (возвращает False)."""
+        if self.dry_run:
+            logger.debug(
+                "dry-run: отклик на %s: %s",
+                vacancy["alternate_url"],
+                message,
+            )
+            return False
+        self.api_client.post(
+            f"/negotiations/{nid}/messages",
+            message=message,
+            delay=random.uniform(1, 3),
+        )
+        print(f"📨 Отправлено для {vacancy['alternate_url']}")
+        return True
+
+    def _after_reply(self, negotiation, nid, vacancy, placeholders) -> None:
+        """Хук после успешной отправки (по умолчанию ничего).
+
+        reply_slot переопределяет для многоходового диалога с ботом.
+        """
+        pass
 
     def reply_employers(self):
         blacklist = set(self.tool.get_blacklisted())
@@ -239,34 +287,26 @@ class Operation(BaseOperation):
                 if not last_message:
                     continue
 
-                is_employer_message = (
-                    last_message["author"]["participant_type"] == "employer"
-                )
-
-                if is_employer_message or not negotiation.get(
-                    "viewed_by_opponent"
-                ):
+                if self._should_reply(negotiation, last_message):
                     send_message = ""
                     if self.reply_message:
                         send_message = (
                             rand_text(self.reply_message) % placeholders
                         )
                         logger.debug(f"Template message: {send_message}")
-                    elif self.cover_letter_ai:
+                    elif self._ai_reply_enabled():
                         try:
-                            ai_query = (
-                                f"Вакансия: {placeholders['vacancy_name']}\n"
-                                f"История переписки:\n"
-                                + "\n".join(message_history[-10:])
-                                + f"\n\nИнструкция: {self.message_prompt}"
-                            )
-                            send_message = self.cover_letter_ai.complete(
-                                ai_query
+                            send_message = self._generate_reply(
+                                negotiation,
+                                vacancy,
+                                message_history,
+                                placeholders,
+                                last_message,
                             )
                             logger.debug(f"AI message: {send_message}")
                         except AIError as ex:
                             logger.warning(
-                                f"Ошибка OpenAI для чата {nid}: {ex}"
+                                f"Ошибка AI для чата {nid}: {ex}"
                             )
                             continue
                     else:
@@ -323,21 +363,15 @@ class Operation(BaseOperation):
                             print("❌ Отмена заявки", vacancy["alternate_url"])
                             continue
 
-                    # Финальная отправка текста
-                    if self.dry_run:
-                        logger.debug(
-                            "dry-run: отклик на %s: %s",
-                            vacancy["alternate_url"],
-                            send_message,
-                        )
+                    # Пустой ответ (например, эскалация в сабклассе) — не шлём.
+                    if not send_message:
                         continue
 
-                    self.api_client.post(
-                        f"/negotiations/{nid}/messages",
-                        message=send_message,
-                        delay=random.uniform(1, 3),
-                    )
-                    print(f"📨 Отправлено для {vacancy['alternate_url']}")
+                    if self._send_message(nid, send_message, vacancy):
+                        # Хук для многоходового диалога (см. reply_slot).
+                        self._after_reply(
+                            negotiation, nid, vacancy, placeholders
+                        )
 
             except ApiError as ex:
                 logger.error(ex)

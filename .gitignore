@@ -50,6 +50,10 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 
+# Наша автоматизация: логи запусков и состояние паузы
+logs/
+.state/
+
 # Environments
 .env
 .venv

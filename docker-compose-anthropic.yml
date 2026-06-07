@@ -1,0 +1,26 @@
+# SOCKS5-прокси для Anthropic API через BlancVPN/Outline.
+#
+# ВАЖНО: через этот прокси ходит ТОЛЬКО Anthropic (его читает ChatAnthropic
+# из переменной ANTHROPIC_PROXY_URL). hh.ru идёт НАПРЯМУЮ с российского IP —
+# ни Playwright, ни requests этот прокси не используют. Прокси нужен лишь
+# потому, что Anthropic блокирует РФ-IP.
+#
+# Запуск:   docker compose -f docker-compose-anthropic.yml up -d
+# Проверка: docker compose -f docker-compose-anthropic.yml ps
+# Стоп:     docker compose -f docker-compose-anthropic.yml down
+#
+# Ключ BLANCVPN_OUTLINE_KEY читается из .env (см. .env.example).
+services:
+  hh-anthropic-proxy:
+    image: ghcr.io/shadowsocks/sslocal-rust:v1.24.0
+    container_name: hh-anthropic-proxy
+    restart: unless-stopped
+    command:
+      - sslocal
+      - -v                        # debug-логи (видно per-connection релей и ошибки шифра)
+      - -b
+      - 0.0.0.0:1080
+      - --server-url
+      - ${BLANCVPN_OUTLINE_KEY:?BLANCVPN_OUTLINE_KEY required in .env}
+    ports:
+      - "127.0.0.1:1080:1080"   # доступен только с локалхоста

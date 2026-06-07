@@ -21,6 +21,9 @@ include = [
 python = "^3.11"
 requests = {extras = ["socks"], version = "^2.32.3"}
 prettytable = "^3.6.0"
+# Наши расширения: нативный Anthropic SDK (prompt caching) + YAML-конфиг
+anthropic = "^0.69.0"
+pyyaml = "^6.0"
 # poetry add playwright --optional
 playwright = { version = "^1.57.0", optional = true }
 # Он не работает или устаревший
@@ -30,6 +33,7 @@ pywebview = { version = ">=5.0", optional = true }
 
 # poetry install --with playwright,pillow
 # poetry install -E ui
+socksio = "^1.0.0"
 [tool.poetry.extras]
 playwright = ["playwright"]
 # sixel = ["libsixel-python", "pillow"]

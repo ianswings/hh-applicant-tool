@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.hh.proxy</string>
+
+  <!-- Постоянный SSH-SOCKS туннель к зарубежному VPS (для Anthropic-капчи и Telegram) -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/autossh</string>
+    <string>-M</string><string>0</string>
+    <string>-N</string>
+    <string>-o</string><string>ServerAliveInterval=30</string>
+    <string>-o</string><string>ServerAliveCountMax=3</string>
+    <string>-o</string><string>ExitOnForwardFailure=yes</string>
+    <string>-o</string><string>StrictHostKeyChecking=accept-new</string>
+    <string>-i</string><string>/Users/yanik/.ssh/hh_vps</string>
+    <string>-D</string><string>127.0.0.1:1080</string>
+    <string>root@89.47.164.209</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>AUTOSSH_GATETIME</key><string>0</string>
+  </dict>
+
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/yanik/hh-applicant-tool/logs/proxy.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/yanik/hh-applicant-tool/logs/proxy.log</string>
+</dict>
+</plist>

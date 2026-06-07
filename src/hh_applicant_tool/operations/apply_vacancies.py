@@ -362,6 +362,31 @@ class Operation(BaseOperation):
 
         self._apply_vacancies()
 
+        # exit-code для оркестрации (run-apply-slot.sh): 10 — дневной лимит после
+        # отправок (паузим до завтра); 11 — лимит при 0 отправок (не паузим, гоним
+        # каждый час, лимит ещё не сбросился); 0 — норма.
+        if self._limit_reached:
+            return 10 if self._total_applied > 0 else 11
+        return 0
+
+    def _generate_letter(
+        self, vacancy: dict, message_placeholders: dict
+    ) -> str:
+        """Формирует текст сопроводительного письма для отклика.
+
+        Вынесено в отдельный метод как seam для переопределения
+        (см. operations/apply_slot.py — слот-шаблон через Anthropic).
+        """
+        if self.cover_letter_ai:
+            msg = self.message_prompt + "\n\n"
+            msg += (
+                "Название вакансии: " + message_placeholders["vacancy_name"]
+            )
+            msg += "Мое резюме: " + message_placeholders["resume_title"]
+            logger.debug("prompt: %s", msg)
+            return self.cover_letter_ai.complete(msg)
+        return rand_text(self.cover_letter) % message_placeholders
+
     def _get_full_resume(self, resume_id: str) -> dict:
         return self.api_client.get(f"/resumes/{resume_id}")
 
@@ -639,10 +664,16 @@ class Operation(BaseOperation):
     SEL_CAPTCHA_INPUT = 'input[data-qa="account-captcha-input"]'
 
     # Даже куки не грузятся, исправь
+    def _recognize_captcha(self, img_bytes: bytes) -> str:
+        """Распознаёт капчу через AI.
+
+        Вынесено как seam для переопределения (см. operations/apply_slot.py —
+        распознавание через Anthropic vision вместо их OpenAI-клиента).
+        """
+        return self.tool.get_captcha_ai().solve_captcha(img_bytes)
+
     async def _solve_captcha_async(self, captcha_url: str) -> bool:
         from playwright.async_api import async_playwright
-
-        captcha_ai = self.tool.get_captcha_ai()
 
         async with async_playwright() as pw:
             browser = await pw.chromium.launch(headless=True)
@@ -659,7 +690,7 @@ class Operation(BaseOperation):
                 img_bytes = await captcha_element.screenshot()
 
                 captcha_text = await asyncio.to_thread(
-                    captcha_ai.solve_captcha, img_bytes
+                    self._recognize_captcha, img_bytes
                 )
 
                 if not captcha_text:
@@ -689,6 +720,9 @@ class Operation(BaseOperation):
         return False
 
     def _apply_vacancies(self) -> None:
+        # Счётчики для exit-code (см. run): сколько отправлено и был ли лимит.
+        self._total_applied = 0
+        self._limit_reached = False
         resumes: list[datatypes.Resume] = self.tool.get_resumes()
         try:
             self.tool.storage.resumes.save_batch(resumes)
@@ -717,6 +751,7 @@ class Operation(BaseOperation):
                 seen_employers=seen_employers,
             )
             if limit_reached:
+                self._limit_reached = True
                 logger.warning(
                     "Лимит откликов hh.ru исчерпан. Пропускаю оставшиеся резюме."
                 )
@@ -974,23 +1009,9 @@ class Operation(BaseOperation):
                 if self.force_message or vacancy.get(
                     "response_letter_required"
                 ):
-                    if self.cover_letter_ai:
-                        msg = self.message_prompt + "\n\n"
-                        msg += (
-                            "Название вакансии: "
-                            + message_placeholders["vacancy_name"]
-                        )
-                        msg += (
-                            "Мое резюме: "
-                            + message_placeholders["resume_title"]
-                        )
-                        logger.debug("prompt: %s", msg)
-                        letter = self.cover_letter_ai.complete(msg)
-                    else:
-                        letter = (
-                            rand_text(self.cover_letter) % message_placeholders
-                        )
-
+                    letter = self._generate_letter(
+                        vacancy, message_placeholders
+                    )
                     logger.debug(letter)
 
                 logger.debug(
@@ -1010,6 +1031,7 @@ class Operation(BaseOperation):
                                 vacancy_id=vacancy["id"],
                                 resume_hash=resume["id"],
                                 letter=letter,
+                                vacancy=vacancy,
                             )
                             if result.get("success") == "true":
                                 applied_count += 1
@@ -1140,6 +1162,7 @@ class Operation(BaseOperation):
         print(
             f"✅️ Закончили рассылку для резюме: {resume['title']}. Отправлено: {applied_count}"
         )
+        self._total_applied = getattr(self, "_total_applied", 0) + applied_count
         return limit_reached
 
     def _send_email(self, to: str, subject: str, body: str) -> None:
@@ -1172,13 +1195,79 @@ class Operation(BaseOperation):
         except json.JSONDecodeError as ex:
             raise ValueError("Не могу распарсить vacancyTests.") from ex
 
+    def _solve_test_task(self, task: dict) -> tuple[str, Any]:
+        """Возвращает (ключ payload, значение) для одного задания теста.
+
+        Вынесено в отдельный метод как seam для переопределения
+        (см. operations/apply_slot.py — QuestionResolver вместо
+        середины списка / свободного AI-ответа).
+        """
+        field_name = f"task_{task['id']}"
+        solutions = task.get("candidateSolutions") or []
+        question = (task.get("description") or "").strip()
+
+        if solutions:
+            if self.cover_letter_ai:
+                options = "\n".join(
+                    [
+                        f"{s['id']}: {strip_tags(s['text'])}"
+                        for s in solutions
+                    ]
+                )
+                prompt = (
+                    f"Вопрос: {question}\n"
+                    f"Варианты:\n{options}\n"
+                    f"Выбери ID правильного ответа. Пришли только ID."
+                )
+                ai_answer = self.cover_letter_ai.complete(prompt).strip()
+                # Ищем ID в ответе AI на случай лишнего текста
+                match = re.search(r"\d+", ai_answer)
+                selected_id = (
+                    match.group(0) if match else solutions[0]["id"]
+                )
+                return field_name, selected_id
+
+            yes_solution = next(
+                filter(lambda x: x["text"].lower() == "да", solutions),
+                None,
+            )
+            return field_name, (
+                yes_solution["id"]
+                if yes_solution
+                # По статистике правильный ответ в большинстве случаев
+                # находится посередине
+                else solutions[len(solutions) // 2]["id"]
+            )
+
+        # Рандомные эмоджи
+        # payload[f"{field_name}_text"] = "".join(
+        #     chr(random.randint(0x1F300, 0x1F64F))
+        #     for _ in range(random.randint(3, 15))
+        # )
+
+        if "://" in question:
+            answer = rand_text(
+                "{{Простите|Извините}, но я не перехожу по {внешним|сторонним} ссылкам, так как {опасаюсь взлома|не хочу {быть взломанным|подхватить вирус|чтобы у меня {со|с банковского} счета украли деньги}}.|У меня нет времени на заполнение анкет и гуглодоков}"
+            )
+        elif self.cover_letter_ai:
+            prompt = f"Дай краткий и профессиональный ответ на вопрос: {question}"
+            answer = self.cover_letter_ai.complete(prompt)
+        # Тупоеблые любят вопросы с ответами да/нет, где ответ да является правильным в большинстве случаев.
+        else:
+            answer = "Да"
+
+        return f"{field_name}_text", answer
+
     def _solve_vacancy_test(
         self,
         vacancy_id: str | int,
         resume_hash: str,
         letter: str = "",
+        vacancy: dict | None = None,
     ) -> dict[str, Any]:
         """Загружает тест, ждет паузу и отправляет отклик."""
+        # Сохраняем вакансию для seam'а _solve_test_task (контекст в сабклассе).
+        self._current_vacancy = vacancy
         response_url = f"https://hh.ru/applicant/vacancy_response?vacancyId={vacancy_id}&startedWithQuestion=false&hhtmFrom=vacancy"
 
         # Загружаем данные теста и токен
@@ -1209,62 +1298,8 @@ class Operation(BaseOperation):
         }
 
         for task in test_data["tasks"]:
-            field_name = f"task_{task['id']}"
-            solutions = task.get("candidateSolutions") or []
-            question = (task.get("description") or "").strip()
-
-            if solutions:
-                if self.cover_letter_ai:
-                    options = "\n".join(
-                        [
-                            f"{s['id']}: {strip_tags(s['text'])}"
-                            for s in solutions
-                        ]
-                    )
-                    prompt = (
-                        f"Вопрос: {question}\n"
-                        f"Варианты:\n{options}\n"
-                        f"Выбери ID правильного ответа. Пришли только ID."
-                    )
-                    ai_answer = self.cover_letter_ai.complete(prompt).strip()
-                    # Ищем ID в ответе AI на случай лишнего текста
-                    match = re.search(r"\d+", ai_answer)
-                    selected_id = (
-                        match.group(0) if match else solutions[0]["id"]
-                    )
-                    payload[field_name] = selected_id
-                else:
-                    yes_solution = next(
-                        filter(lambda x: x["text"].lower() == "да", solutions),
-                        None,
-                    )
-
-                    payload[field_name] = (
-                        yes_solution["id"]
-                        if yes_solution
-                        # По статистике правильный ответ в большинстве случаев
-                        # находится посередине
-                        else solutions[len(solutions) // 2]["id"]
-                    )
-            else:
-                # Рандомные эмоджи
-                # payload[f"{field_name}_text"] = "".join(
-                #     chr(random.randint(0x1F300, 0x1F64F))
-                #     for _ in range(random.randint(3, 15))
-                # )
-
-                if "://" in question:
-                    answer = rand_text(
-                        "{{Простите|Извините}, но я не перехожу по {внешним|сторонним} ссылкам, так как {опасаюсь взлома|не хочу {быть взломанным|подхватить вирус|чтобы у меня {со|с банковского} счета украли деньги}}.|У меня нет времени на заполнение анкет и гуглодоков}"
-                    )
-                elif self.cover_letter_ai:
-                    prompt = f"Дай краткий и профессиональный ответ на вопрос: {question}"
-                    answer = self.cover_letter_ai.complete(prompt)
-                # Тупоеблые любят вопросы с ответами да/нет, где ответ да является правильным в большинстве случаев.
-                else:
-                    answer = "Да"
-
-                payload[f"{field_name}_text"] = answer
+            key, value = self._solve_test_task(task)
+            payload[key] = value
 
         logger.debug(f"{payload = }")
 
