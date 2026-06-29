@@ -114,12 +114,28 @@ class Operation(ApplyOperation):
     def _notify_apply_summary(self) -> None:
         sent = getattr(self, "_total_applied", 0)
         limit = getattr(self, "_limit_reached", False)
-        msg = f"📊 apply: отправлено {sent}" + (
+        label = self._resume_label()
+        prefix = f"📊 apply [{label}]" if label else "📊 apply"
+        msg = f"{prefix}: отправлено {sent}" + (
             "; ⛔ дневной лимит исчерпан" if limit else ""
         )
         print(msg)
         if self._notifier and not getattr(self, "dry_run", False):
             self._notifier.send(msg)
+
+    def _resume_label(self) -> str:
+        """Название резюме прогона (для отчёта). Пусто, если --resume-id не задан
+        (тогда база перебирает все резюме — единой подписи нет)."""
+        rid = getattr(self, "resume_id", None)
+        if not rid:
+            return ""
+        try:
+            for r in self.tool.get_resumes():
+                if r["id"] == rid:
+                    return r.get("title") or rid
+        except Exception as ex:
+            logger.debug("Не удалось получить title резюме %s: %s", rid, ex)
+        return rid
 
     # --- seam 1: cover letter -------------------------------------------------
     def _generate_letter(

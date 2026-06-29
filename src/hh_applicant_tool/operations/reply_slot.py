@@ -22,6 +22,7 @@ import json
 import logging
 import re
 import time
+from collections import defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -63,6 +64,22 @@ _FORM_LINK_RE = re.compile(
     r"forms\.gle|docs\.google\.com/forms|forms\.yandex|surveymonkey|typeform|"
     r"google\.com/forms|анкет\w*\s+по\s+ссылк|заполнит\w*\s+(?:форм|анкет|опрос)|"
     r"пройдит\w*\s+по\s+ссылк|тест\w*\s+по\s+ссылк",
+    re.IGNORECASE,
+)
+
+# Fast-path: приглашение продолжить общение в мессенджере с ЖИВЫМ рекрутёром
+# (telegram/whatsapp). Это НЕ external_link (форма/бот по ссылке), а контакт с
+# человеком → эскалируем тебе (сам решаешь, идти ли в личку). gemma путает такие
+# сообщения с external_link («перейти + ссылка») и шлёт авто-отказ — перехватываем
+# детерминированно, ДО локальной модели. Боты/формы отсекаем _MESSENGER_BOT_RE.
+_MESSENGER_RE = re.compile(
+    r"t\.me/|telegram|телег\w*|\bтг\b|whats\s?app|вотсап\w*|ватсап\w*|вацап\w*",
+    re.IGNORECASE,
+)
+# Если рядом эти признаки — это бот/форма/анкета (а не живой человек): оставляем
+# gemma, она отнесёт к external_link → авто-отказ. «_bot»/«…bot» в хэндле — бот.
+_MESSENGER_BOT_RE = re.compile(
+    r"\bбот\w*|\bbot\b|_bot|\w*bot\b|форм\w*|анкет\w*|опрос\w*",
     re.IGNORECASE,
 )
 
@@ -155,10 +172,18 @@ class Operation(ReplyOperation):
         self.reply_message = ""
         self._review = bool(getattr(args, "review", False))
         self._notifier = TelegramNotifier.from_env()
-        self._n_answered = 0
-        self._n_escalated = 0
-        self._n_acknowledged = 0
+        # Счётчики прогона с разбивкой по резюме (title → answered/escalated/
+        # acknowledged). Отклики идут двумя резюме — в отчёт пишем, по какому что.
+        self._stats: dict[str, dict[str, int]] = defaultdict(
+            lambda: {"answered": 0, "escalated": 0, "acknowledged": 0}
+        )
         self._seen = self._load_seen()  # дедуп уже обработанных сообщений
+
+        # Базовый _setup жёстко ставит resume_id = first_resume_id() → reply
+        # отвечал бы только в чатах ОДНОГО резюме. Сбрасываем, чтобы вести
+        # переписку по ВСЕМ опубликованным резюме (отклики идут двумя). --resume-id
+        # (если задан явно) сужает обратно к одному.
+        self.resume_id = getattr(args, "resume_id", None)
 
         cfg = load_config(args.our_config)
         self._profile = cfg.get("profile", {})
@@ -188,6 +213,11 @@ class Operation(ReplyOperation):
                 "[reply] Haiku недоступен (нет ANTHROPIC_API_KEY) — экспертные "
                 "вопросы будут эскалироваться."
             )
+
+        # Позиционирование ответа под резюме чата (вариант B): id резюме hh →
+        # роль. Опыт общий (один resume.md), меняется только подача под нишу.
+        # Ключ "default" — фолбэк, если id чата нет в карте.
+        self._resume_positioning = reply_cfg.get("resume_positioning") or {}
 
         self._reply_system = reply_cfg.get("system_prompt") or DEFAULT_REPLY_SYSTEM
         self._reply_instruction = (
@@ -275,6 +305,9 @@ class Operation(ReplyOperation):
         self._last_msg_id = last_message.get("id")
         self._last_msg_hash = _text_hash(last_message.get("text"))
         self._cur_cid = str(negotiation.get("id"))  # для дедупа (_mark_seen)
+        # Резюме, по которому пришёл этот чат → позиционирование ответа (вариант B).
+        self._cur_resume_id = (negotiation.get("resume") or {}).get("id")
+        self._cur_resume_title = placeholders.get("resume_title", "")
 
         if route == "test_task_practical":
             self._review_print(
@@ -335,7 +368,7 @@ class Operation(ReplyOperation):
         if route == "acknowledgement":
             # Авто-подтверждение получения отклика → тишина: не отвечаем и не
             # эскалируем (дёргать тебя по «спасибо, рассмотрим» незачем).
-            self._n_acknowledged += 1
+            self._bump("acknowledged")
             self._mark_seen()  # молчим → запомнить, чтобы не гонять каждый прогон
             self._review_print(
                 "🤫", "acknowledgement", placeholders, msg_text, None
@@ -381,6 +414,10 @@ class Operation(ReplyOperation):
     def _classify(self, msg_text: str, message_history: list[str]) -> str:
         if _FORM_LINK_RE.search(msg_text):
             return "external_link"
+        # Мессенджер-контакт с живым рекрутёром → эскалация (route=other), минуя
+        # gemma (она ошибочно даёт external_link → авто-отказ). Боты/формы — мимо.
+        if _MESSENGER_RE.search(msg_text) and not _MESSENGER_BOT_RE.search(msg_text):
+            return "other"
         return self._classifier.classify(msg_text, history=message_history[-6:])
 
     def _review_print(
@@ -538,12 +575,15 @@ class Operation(ReplyOperation):
     def _escalate(
         self, route: str, vacancy: dict, placeholders: dict, msg_text: str
     ) -> None:
-        self._n_escalated += 1
+        self._bump("escalated")
         self._mark_seen()  # не ответили → запомнить, чтобы не эскалировать повторно
         emp = placeholders.get("employer_name", "")
         vac = placeholders.get("vacancy_name", "")
+        resume_title = placeholders.get("resume_title", "")
         url = (vacancy or {}).get("alternate_url", "")
         print(f"\n🙋 ТРЕБУЕТ ТЕБЯ [{route}] — {emp} / {vac}")
+        if resume_title:
+            print(f"   📄 Резюме: {resume_title}")
         print(f"   Сообщение работодателя: {msg_text[:500]}")
         print("   (ответь вручную)")
         # Telegram-уведомление (в dry-run не шлём, чтобы не спамить на тестах).
@@ -551,6 +591,7 @@ class Operation(ReplyOperation):
             self._notifier.send(
                 f"🙋 Требует тебя [{route}]\n"
                 f"🏢 {emp}\n💼 {vac}\n"
+                + (f"📄 {resume_title}\n" if resume_title else "")
                 + (f"🔗 {url}\n" if url else "")
                 + f"\nСообщение работодателя:\n{msg_text[:500]}"
             )
@@ -560,12 +601,15 @@ class Operation(ReplyOperation):
     ) -> None:
         """Концептуальное тестовое в режиме draft: готовый черновик тебе на
         подтверждение, в чат НЕ отправляем (проверяешь и шлёшь сам)."""
-        self._n_escalated += 1
+        self._bump("escalated")
         self._mark_seen()
         emp = placeholders.get("employer_name", "")
         vac = placeholders.get("vacancy_name", "")
+        resume_title = placeholders.get("resume_title", "")
         url = (vacancy or {}).get("alternate_url", "")
         print(f"\n📝 ЧЕРНОВИК НА ПОДТВЕРЖДЕНИЕ [test_task_conceptual] — {emp} / {vac}")
+        if resume_title:
+            print(f"   📄 Резюме: {resume_title}")
         print(f"   📩 Задание: {msg_text[:500]}")
         print(f"   ✍️  Черновик ответа:\n{draft}")
         print("   (проверь и отправь сам)")
@@ -573,6 +617,7 @@ class Operation(ReplyOperation):
             self._notifier.send(
                 f"📝 Черновик ответа на тестовое\n"
                 f"🏢 {emp}\n💼 {vac}\n"
+                + (f"📄 {resume_title}\n" if resume_title else "")
                 + (f"🔗 {url}\n" if url else "")
                 + f"\nЗадание:\n{msg_text[:500]}\n\nЧерновик:\n{draft}"
             )
@@ -590,15 +635,29 @@ class Operation(ReplyOperation):
                 return False
             raise
         if ok:
-            self._n_answered += 1
+            self._bump("answered")
         return ok
 
+    def _bump(self, kind: str) -> None:
+        """Инкремент счётчика прогона для резюме ТЕКУЩЕГО чата (см. _stats)."""
+        title = getattr(self, "_cur_resume_title", "") or "—"
+        self._stats[title][kind] += 1
+
     def _notify_reply_summary(self) -> None:
-        msg = (
-            f"📊 reply: ответил {self._n_answered}, "
-            f"эскалировал {self._n_escalated}, "
-            f"подтверждений без ответа {self._n_acknowledged}."
-        )
+        total_a = sum(s["answered"] for s in self._stats.values())
+        total_e = sum(s["escalated"] for s in self._stats.values())
+        total_k = sum(s["acknowledged"] for s in self._stats.values())
+        lines = [
+            f"📊 reply: ответил {total_a}, эскалировал {total_e}, "
+            f"подтверждений без ответа {total_k}."
+        ]
+        # Разбивка по резюме — чтобы видеть, по какому шла переписка.
+        for title, s in self._stats.items():
+            lines.append(
+                f"📄 {title}: ответил {s['answered']}, "
+                f"эскалировал {s['escalated']}, подтв. {s['acknowledged']}"
+            )
+        msg = "\n".join(lines)
         print(msg)
         if self._notifier and not self.dry_run:
             self._notifier.send(msg)
@@ -636,10 +695,26 @@ class Operation(ReplyOperation):
                 "cache_control": {"type": "ephemeral"},
             },
         ]
+        # Позиционирование под резюме чата (вариант B) — в user, чтобы не ломать
+        # кэш resume.md в system-блоке. Опыт общий, меняется только подача роли.
+        pos = (
+            self._resume_positioning.get(getattr(self, "_cur_resume_id", None))
+            or self._resume_positioning.get("default")
+            or ""
+        )
+        pos_line = ""
+        if pos:
+            title = getattr(self, "_cur_resume_title", "")
+            pos_line = (
+                f"ПОЗИЦИОНИРОВАНИЕ (отвечай строго под эту роль): {pos}"
+                + (f" (резюме на hh: {title})" if title else "")
+                + "\n\n"
+            )
         user = (
-            f"ВАКАНСИЯ:\n{_vacancy_to_text(full)}\n\n"
-            f"ПЕРЕПИСКА:\n" + "\n".join(message_history[-12:]) + "\n\n"
-            f"{instruction or self._reply_instruction}\nВерни JSON."
+            pos_line
+            + f"ВАКАНСИЯ:\n{_vacancy_to_text(full)}\n\n"
+            + "ПЕРЕПИСКА:\n" + "\n".join(message_history[-12:]) + "\n\n"
+            + f"{instruction or self._reply_instruction}\nВерни JSON."
         )
         raw = chat.complete_with_caching(
             system, user, prefill="{",
