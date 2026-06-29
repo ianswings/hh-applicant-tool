@@ -122,10 +122,35 @@ if ! curl -s --max-time 5 "$OLLAMA_URL/api/tags" >/dev/null; then
   exit 1
 fi
 
+# 4.6 Watchdog: жёсткий потолок на прогон (bash-native, без coreutils/gtimeout).
+#     Зачем: при зависшем сетевом вызове процесс висит вечно, а launchd НЕ
+#     запускает новый агент, пока этот «жив» → расписание встаёт. Потолок убивает
+#     зомби (TERM, через 30с KILL) и освобождает слот. set -m → каждая фоновая
+#     команда в своей process-group, поэтому kill -- -PGID бьёт и poetry, и python.
+WATCHDOG_SEC="${WATCHDOG_SEC:-2700}"   # 45 мин на ОДИН прогон apply-slot
+run_with_watchdog() {                  # $1=лимит_сек, далее — команда
+  local limit="$1"; shift
+  set -m
+  "$@" &
+  local cmd=$!
+  ( sleep "$limit"; kill -TERM -"$cmd" 2>/dev/null; sleep 30; kill -KILL -"$cmd" 2>/dev/null ) &
+  local wd=$!
+  wait "$cmd"; local rc=$?
+  kill "$wd" 2>/dev/null; wait "$wd" 2>/dev/null   # снять будильник, если прогон закончился сам
+  return "$rc"
+}
+
 # 5. Обработка дневного лимита по exit-code прогона:
 #    10 — лимит ПОСЛЕ отправок → пауза до завтра (+24ч 5м), второй прогон не нужен;
 #    11 — лимит при 0 отправок (ещё не сбросился) → НЕ паузим, повтор через час;
 #    иначе — норма, паузу снимаем.
+# Пауза при массовой капче (часы) — из config.yaml::apply.captcha_pause_hours, дефолт 2.
+read_captcha_pause_hours() {
+  local h
+  h=$(poetry run python -c "import yaml;print(int(yaml.safe_load(open('src/hh_applicant_tool/our_extensions/config.yaml')).get('apply',{}).get('captcha_pause_hours',2)))" 2>/dev/null)
+  [[ "$h" =~ ^[0-9]+$ ]] && echo "$h" || echo 2
+}
+
 handle_rc() {
   local rc="$1"
   if [[ $rc -eq 10 ]]; then
@@ -135,6 +160,11 @@ handle_rc() {
   elif [[ $rc -eq 11 ]]; then
     rm -f "$PAUSE_FILE"
     echo "⏳ Лимит ещё активен (0 отправлено) — паузу не ставим, повтор через час."
+  elif [[ $rc -eq 12 ]]; then
+    local hours until_ts; hours="$(read_captcha_pause_hours)"
+    until_ts=$(( $(date +%s) + hours * 3600 ))
+    echo "$until_ts" > "$PAUSE_FILE"
+    echo "⛔ Массовая капча (hh лимитирует аккаунт). Пауза ${hours}ч, следующий apply: $(date -r "$until_ts" '+%Y-%m-%d %H:%M')."
   else
     rm -f "$PAUSE_FILE"
   fi
@@ -143,14 +173,14 @@ handle_rc() {
 # 6. Прогон 1 — Python Backend. hh.ru — direct, Anthropic — через ANTHROPIC_PROXY_URL.
 echo "🚀 [1/2] apply-slot Backend (resume $RESUME_BACKEND) (+ доп. аргументы: $*)"
 set +e
-poetry run hh-applicant-tool apply-slot \
+run_with_watchdog "$WATCHDOG_SEC" poetry run hh-applicant-tool apply-slot \
   --resume-id "$RESUME_BACKEND" --search "$SEARCH_BACKEND" "${COMMON_ARGS[@]}" "$@"
 rc_backend=$?
 set -e
 
-# Лимит общий на аккаунт: если backend упёрся — второй прогон бессмыслен.
-if [[ $rc_backend -eq 10 || $rc_backend -eq 11 ]]; then
-  echo "⚠️  Backend-прогон упёрся в дневной лимит (rc=$rc_backend) — AI-прогон пропускаем."
+# Лимит/капча общие на аккаунт: если backend упёрся — второй прогон бессмыслен.
+if [[ $rc_backend -eq 10 || $rc_backend -eq 11 || $rc_backend -eq 12 ]]; then
+  echo "⚠️  Backend-прогон остановлен (rc=$rc_backend: лимит/капча) — AI-прогон пропускаем."
   handle_rc "$rc_backend"
   echo "===== apply-dual конец $(date '+%Y-%m-%d %H:%M:%S') (backend=$rc_backend, ai=skipped) ====="
   exit "$rc_backend"
@@ -159,7 +189,7 @@ fi
 # 7. Прогон 2 — AI / LLM Engineer.
 echo "🚀 [2/2] apply-slot AI/LLM (resume $RESUME_AI) (+ доп. аргументы: $*)"
 set +e
-poetry run hh-applicant-tool apply-slot \
+run_with_watchdog "$WATCHDOG_SEC" poetry run hh-applicant-tool apply-slot \
   --resume-id "$RESUME_AI" --search "$SEARCH_AI" "${COMMON_ARGS[@]}" "$@"
 rc_ai=$?
 set -e

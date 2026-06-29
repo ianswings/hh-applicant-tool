@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..ai.anthropic import ChatAnthropic
 from ..ai.factory import make_chat
+from ..api.errors import CaptchaRequired
 from ..our_extensions import load_config, load_resume
 from ..our_extensions.cover import build_cover_letter
 from ..our_extensions.notify import TelegramNotifier
@@ -77,6 +78,12 @@ class Operation(ApplyOperation):
         self._cfg = load_config(args.our_config)
         self._cover_cfg = self._cfg.get("cover_letter", {})
         self._profile = self._cfg.get("profile", {})
+        # Captcha circuit-breaker: стоп после N капч подряд (0 = выкл). Читается
+        # ДО super().run() — базовый _apply_vacancies уважает этот порог.
+        apply_cfg = self._cfg.get("apply", {})
+        self._captcha_threshold = int(
+            apply_cfg.get("captcha_circuit_breaker", 0) or 0
+        )
         self._resume_text = load_resume(args.our_resume)
 
         llm_cfg = self._cfg.get("llm", {})
@@ -114,10 +121,17 @@ class Operation(ApplyOperation):
     def _notify_apply_summary(self) -> None:
         sent = getattr(self, "_total_applied", 0)
         limit = getattr(self, "_limit_reached", False)
+        tripped = getattr(self, "_captcha_tripped", False)
         label = self._resume_label()
         prefix = f"📊 apply [{label}]" if label else "📊 apply"
-        msg = f"{prefix}: отправлено {sent}" + (
-            "; ⛔ дневной лимит исчерпан" if limit else ""
+        msg = (
+            f"{prefix}: отправлено {sent}"
+            + ("; ⛔ дневной лимит исчерпан" if limit else "")
+            + (
+                "; ⛔ массовая капча — прогон остановлен (hh лимитирует)"
+                if tripped
+                else ""
+            )
         )
         print(msg)
         if self._notifier and not getattr(self, "dry_run", False):
@@ -147,6 +161,15 @@ class Operation(ApplyOperation):
             try:
                 fetched = self.api_client.get(f"/vacancies/{vacancy_id}")
                 full = {**vacancy, **fetched}
+                self._reset_captcha()  # успешный GET → hh обслуживает
+            except CaptchaRequired:
+                # Капча на GET вакансии — её не решаем, пишем по сниппету. Но
+                # засчитываем: лавина таких капч = hh лимитирует (circuit-breaker).
+                self._note_captcha()
+                logger.warning(
+                    "Капча при получении вакансии %s — письмо по сниппету",
+                    vacancy_id,
+                )
             except Exception as ex:
                 logger.warning(
                     "Не удалось получить полную вакансию %s: %s",

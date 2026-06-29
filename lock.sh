@@ -17,7 +17,15 @@ acquire_lock() {
     fi
     oldpid="$(cat "$LOCK/pid" 2>/dev/null || true)"
     if [[ -n "$oldpid" ]] && kill -0 "$oldpid" 2>/dev/null; then
-      age=$(( $(date +%s) - $(stat -f %m "$LOCK") ))
+      # mtime lock'а; если каталог исчез между проверками (гонка) — stat пуст,
+      # считаем lock протухшим и перезахватываем (иначе арифметика падала с
+      # "operand expected").
+      mtime="$(stat -f %m "$LOCK" 2>/dev/null)"
+      if [[ ! "$mtime" =~ ^[0-9]+$ ]]; then
+        rm -rf "$LOCK" 2>/dev/null
+        continue
+      fi
+      age=$(( $(date +%s) - mtime ))
       if (( age > MAX_RUNTIME )); then
         echo "🔪 Прежний прогон висит $((age/60)) мин (pid $oldpid) — убиваю и замещаю." >&2
         kill -TERM "-$oldpid" 2>/dev/null || kill -TERM "$oldpid" 2>/dev/null || true

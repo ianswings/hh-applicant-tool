@@ -58,10 +58,28 @@ if ! curl -s --max-time 5 "$OLLAMA_URL/api/tags" >/dev/null; then
   exit 1
 fi
 
+# 4.1 Watchdog: жёсткий потолок на прогон (bash-native, без coreutils/gtimeout).
+#     При зависшем сетевом вызове процесс висит вечно, а launchd НЕ запускает
+#     новый агент, пока этот «жив» → расписание встаёт. Потолок убивает зомби.
+#     45 мин: reply бывает длинным из-за многоходовых диалогов с ботами
+#     (max_turns × poll_timeout). set -m → kill -- -PGID бьёт и poetry, и python.
+WATCHDOG_SEC="${WATCHDOG_SEC:-2700}"   # 45 мин
+run_with_watchdog() {                  # $1=лимит_сек, далее — команда
+  local limit="$1"; shift
+  set -m
+  "$@" &
+  local cmd=$!
+  ( sleep "$limit"; kill -TERM -"$cmd" 2>/dev/null; sleep 30; kill -KILL -"$cmd" 2>/dev/null ) &
+  local wd=$!
+  wait "$cmd"; local rc=$?
+  kill "$wd" 2>/dev/null; wait "$wd" 2>/dev/null
+  return "$rc"
+}
+
 # 5. Запуск. hh — direct, Anthropic — через прокси, классификация — локально.
 echo "🚀 reply-slot $*"
 set +e
-poetry run hh-applicant-tool reply-slot "$@"
+run_with_watchdog "$WATCHDOG_SEC" poetry run hh-applicant-tool reply-slot "$@"
 rc=$?
 set -e
 echo "===== reply конец $(date '+%Y-%m-%d %H:%M:%S') (exit $rc) ====="

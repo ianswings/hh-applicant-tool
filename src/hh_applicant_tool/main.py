@@ -37,6 +37,27 @@ logger = logging.getLogger(__package__)
 
 OPERATIONS = "operations"
 
+# Дефолтный таймаут сетевых запросов (connect, read) в секундах. Без него
+# requests висит ВЕЧНО при обрыве сети/прокси → процесс-зомби, а launchd
+# перестаёт запускать агент (думает, что он ещё работает). См. HANDOFF/инцидент.
+DEFAULT_HTTP_TIMEOUT: tuple[float, float] = (10.0, 30.0)
+
+
+class _TimeoutSession(requests.Session):
+    """requests.Session с дефолтным таймаутом, если вызывающий код его не задал.
+
+    Покрывает СРАЗУ и api_client (он использует ту же session, см. api_client),
+    и сырые session.get/post (тесты вакансий, страница капчи, excluded-фильтр).
+    Явный timeout= в конкретном вызове имеет приоритет.
+    """
+
+    default_timeout: tuple[float, float] | float = DEFAULT_HTTP_TIMEOUT
+
+    def request(self, *args: Any, **kwargs: Any):
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = self.default_timeout
+        return super().request(*args, **kwargs)
+
 
 class BaseOperation:
     def setup_parser(self, parser: argparse.ArgumentParser) -> None: ...
@@ -183,7 +204,7 @@ class HHApplicantTool(MegaTool):
         *,
         log_label: str,
     ) -> requests.Session:
-        session = requests.Session()
+        session = _TimeoutSession()
         session.verify = False
 
         if proxies:

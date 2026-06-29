@@ -40,6 +40,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__package__)
 
 
+class CaptchaCircuitBreaker(Exception):
+    """Массовая капча подряд → hh лимитирует аккаунт, прогон останавливаем.
+
+    Бросается, когда число капч ПОДРЯД (без единого успешного hh-действия)
+    достигает порога. Дальше долбить hh бессмысленно и вредно (усиливает бан).
+    """
+
+
 class Namespace(BaseNamespace):
     resume_id: str | None
     letter_file: Path | None
@@ -365,6 +373,9 @@ class Operation(BaseOperation):
         # exit-code для оркестрации (run-apply-slot.sh): 10 — дневной лимит после
         # отправок (паузим до завтра); 11 — лимит при 0 отправок (не паузим, гоним
         # каждый час, лимит ещё не сбросился); 0 — норма.
+        # 12 — массовая капча (hh лимитирует): скрипт ставит короткую паузу.
+        if getattr(self, "_captcha_tripped", False):
+            return 12
         if self._limit_reached:
             return 10 if self._total_applied > 0 else 11
         return 0
@@ -719,10 +730,29 @@ class Operation(BaseOperation):
 
         return False
 
+    # --- captcha circuit-breaker -------------------------------------------
+    def _note_captcha(self) -> None:
+        """Засчитать капчу. При N подряд (порог) — CaptchaCircuitBreaker."""
+        self._consecutive_captchas += 1
+        threshold = getattr(self, "_captcha_threshold", 0)
+        if threshold and self._consecutive_captchas >= threshold:
+            raise CaptchaCircuitBreaker(
+                f"{self._consecutive_captchas} капч подряд — hh лимитирует аккаунт"
+            )
+
+    def _reset_captcha(self) -> None:
+        """Успешное hh-действие → серия капч прервана, обнуляем счётчик."""
+        self._consecutive_captchas = 0
+
     def _apply_vacancies(self) -> None:
         # Счётчики для exit-code (см. run): сколько отправлено и был ли лимит.
         self._total_applied = 0
         self._limit_reached = False
+        # Captcha circuit-breaker: капчи подряд + флаг срабатывания.
+        self._consecutive_captchas = 0
+        self._captcha_tripped = False
+        if not hasattr(self, "_captcha_threshold"):
+            self._captcha_threshold = 0  # 0 = выключено (базовый класс)
         resumes: list[datatypes.Resume] = self.tool.get_resumes()
         try:
             self.tool.storage.resumes.save_batch(resumes)
@@ -745,11 +775,17 @@ class Operation(BaseOperation):
         seen_employers = set()
 
         for resume in resumes:
-            limit_reached = self._apply_resume(
-                resume=resume,
-                user=me,
-                seen_employers=seen_employers,
-            )
+            try:
+                limit_reached = self._apply_resume(
+                    resume=resume,
+                    user=me,
+                    seen_employers=seen_employers,
+                )
+            except CaptchaCircuitBreaker as ex:
+                self._captcha_tripped = True
+                logger.warning("⛔ %s — прогон остановлен", ex)
+                print(f"⛔ Массовая капча: {ex}. Прогон остановлен.")
+                break
             if limit_reached:
                 self._limit_reached = True
                 logger.warning(
@@ -1035,6 +1071,7 @@ class Operation(BaseOperation):
                             )
                             if result.get("success") == "true":
                                 applied_count += 1
+                                self._reset_captcha()
                                 print(
                                     "📨 Отправили отклик на вакансию с тестом",
                                     vacancy["alternate_url"],
@@ -1073,6 +1110,7 @@ class Operation(BaseOperation):
                             )
                             assert res == {}
                             applied_count += 1
+                            self._reset_captcha()
                             print(
                                 "📨 Отправили отклик на вакансию",
                                 vacancy["alternate_url"],
@@ -1084,6 +1122,9 @@ class Operation(BaseOperation):
                         continue
                     except CaptchaRequired as ex:
                         logger.warning(f"Требуется капча: {ex.captcha_url}")
+                        # Засчитываем капчу ДО попытки решить: если их уже N
+                        # подряд — бросит CaptchaCircuitBreaker и остановит прогон.
+                        self._note_captcha()
                         try:
                             success = asyncio.run(
                                 self._solve_captcha_async(ex.captcha_url)
@@ -1097,6 +1138,7 @@ class Operation(BaseOperation):
                                     )
                                     assert res == {}
                                     applied_count += 1
+                                    self._reset_captcha()
                                     print(
                                         "📨 Отправили отклик на вакансию после капчи",
                                         vacancy["alternate_url"],
@@ -1150,6 +1192,10 @@ class Operation(BaseOperation):
                 break
             except ApiError as ex:
                 logger.warning(ex)
+            except requests.RequestException as ex:
+                # Таймаут/обрыв сети по одной вакансии — не валим весь прогон,
+                # просто пропускаем её (раньше без таймаута тут был вечный вис).
+                logger.error("Сетевая ошибка по вакансии, пропускаю: %s", ex)
             except (BadResponse, AIError) as ex:
                 logger.error(ex)
 

@@ -70,8 +70,25 @@ export PROXY_URL
 # 3. Подъём. КРИТИЧНО: hh.ru ходит НАПРЯМУЮ — глобальные HTTP(S)_PROXY вычищаем,
 #    чтобы requests-сессия hh их не подхватила (Telegram берёт PROXY_URL отдельно).
 unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy || true
+
+# Watchdog: жёсткий потолок (bash-native). Подъём — короткий POST на резюме;
+# 10 мин с запасом. Защищает от зависшего сетевого вызова (без него процесс висел
+# бы вечно). set -m → kill -- -PGID бьёт и poetry, и python.
+WATCHDOG_SEC="${WATCHDOG_SEC:-600}"
+run_with_watchdog() {                  # $1=лимит_сек, далее — команда
+  local limit="$1"; shift
+  set -m
+  "$@" &
+  local cmd=$!
+  ( sleep "$limit"; kill -TERM -"$cmd" 2>/dev/null; sleep 30; kill -KILL -"$cmd" 2>/dev/null ) &
+  local wd=$!
+  wait "$cmd"; local rc=$?
+  kill "$wd" 2>/dev/null; wait "$wd" 2>/dev/null
+  return "$rc"
+}
+
 set +e
-poetry run hh-applicant-tool update
+run_with_watchdog "$WATCHDOG_SEC" poetry run hh-applicant-tool update
 rc=$?
 set -e
 

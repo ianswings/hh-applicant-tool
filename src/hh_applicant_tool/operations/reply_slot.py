@@ -83,6 +83,15 @@ _MESSENGER_BOT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Служебные hh-вставки: виджет «отзывы о работодателе», который hh добавляет
+# в чат как employer-сообщение ПОВЕРХ реального вопроса. Структурного признака
+# в API нет (participant_type=employer как у реального) — детект только по тексту.
+# Привязка к уникальной фразе виджета → near-zero false-positive.
+DEFAULT_SERVICE_PATTERNS = [
+    r"Изучите мнения тех, кто работал здесь",
+    r"У работодателя\s+\d+\s+отзыв",
+]
+
 DEFAULT_EXTERNAL_LINK_REPLY = (
     "Спасибо! По внешним ссылкам не перехожу и формы/боты не заполняю. "
     "Готов ответить на все вопросы голосом на собеседовании — резюме и контакты "
@@ -218,6 +227,15 @@ class Operation(ReplyOperation):
         # роль. Опыт общий (один resume.md), меняется только подача под нишу.
         # Ключ "default" — фолбэк, если id чата нет в карте.
         self._resume_positioning = reply_cfg.get("resume_positioning") or {}
+
+        # Паттерны служебных hh-вставок (виджет отзывов) → их пропускаем при
+        # выборе значимого сообщения и глушим (тишина, не эскалация).
+        patterns = (
+            reply_cfg.get("service_message_patterns") or DEFAULT_SERVICE_PATTERNS
+        )
+        self._service_patterns = [
+            re.compile(p, re.IGNORECASE) for p in patterns
+        ]
 
         self._reply_system = reply_cfg.get("system_prompt") or DEFAULT_REPLY_SYSTEM
         self._reply_instruction = (
@@ -411,7 +429,42 @@ class Operation(ReplyOperation):
         return ""
 
     # --- helpers ---
+    def _is_service_message(self, text: str | None) -> bool:
+        """Служебная hh-вставка (виджет отзывов и т.п.) — детект по тексту."""
+        t = text or ""
+        return any(
+            p.search(t) for p in getattr(self, "_service_patterns", ())
+        )
+
+    def _pick_significant_message(self, items: list, default):
+        """Последнее ЗНАЧИМОЕ сообщение чата (см. базовый seam).
+
+        Логика: среди employer-сообщений, идущих ПОСЛЕ нашего последнего
+        сообщения, берём последнее НЕ-служебное. Если таких нет (после нашего
+        ответа пришли только служебные вставки) — возвращаем default; его
+        _classify распознает как служебное → тишина (а не повторный ответ на
+        уже отвеченный вопрос).
+        """
+        if not items:
+            return default
+        my_last = -1
+        for i, m in enumerate(items):
+            if (m.get("author") or {}).get("participant_type") == "applicant":
+                my_last = i
+        significant = None
+        for m in items[my_last + 1:]:
+            if (m.get("author") or {}).get("participant_type") != "employer":
+                continue
+            if self._is_service_message(m.get("text")):
+                continue
+            significant = m
+        return significant or default
+
     def _classify(self, msg_text: str, message_history: list[str]) -> str:
+        # Служебная hh-вставка просочилась как «последнее» (нет реального вопроса
+        # после неё) → тишина через acknowledgement, тебя не дёргаем.
+        if self._is_service_message(msg_text):
+            return "acknowledgement"
         if _FORM_LINK_RE.search(msg_text):
             return "external_link"
         # Мессенджер-контакт с живым рекрутёром → эскалация (route=other), минуя
@@ -541,16 +594,18 @@ class Operation(ReplyOperation):
         return None
 
     def _fetch_messages(self, nid):
-        """Возвращает (история-строки, последнее сообщение) для чата."""
+        """Возвращает (история-строки, последнее ЗНАЧИМОЕ сообщение) для чата."""
         page = 0
         last_message = None
         history: list[str] = []
+        raw_items: list = []
         while True:
             res = self.api_client.get(
                 f"/negotiations/{nid}/messages", page=page
             )
             if not res["items"]:
                 break
+            raw_items.extend(res["items"])
             last_message = res["items"][-1]
             for m in res["items"]:
                 if not m.get("text"):
@@ -570,6 +625,8 @@ class Operation(ReplyOperation):
             if page + 1 >= res["pages"]:
                 break
             page += 1
+        if last_message is not None:
+            last_message = self._pick_significant_message(raw_items, last_message)
         return history, last_message
 
     def _escalate(

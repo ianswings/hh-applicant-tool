@@ -168,6 +168,15 @@ class Operation(BaseOperation):
         """
         pass
 
+    def _pick_significant_message(self, items: list, default):
+        """Какое сообщение считать «последним значимым» для чата.
+
+        База — последнее (default). reply_slot переопределяет, чтобы пропускать
+        служебные hh-вставки (виджет отзывов о работодателе), которые приходят
+        как employer-сообщения ПОВЕРХ реального вопроса.
+        """
+        return default
+
     def reply_employers(self):
         blacklist = set(self.tool.get_blacklisted())
         me: datatypes.User = self.tool.get_me()
@@ -253,6 +262,7 @@ class Operation(BaseOperation):
                 page: int = 0
                 last_message: datatypes.Message | None = None
                 message_history: list[str] = []
+                raw_items: list[datatypes.Message] = []
                 while True:
                     messages_res: datatypes.PaginatedItems[
                         datatypes.Message
@@ -262,6 +272,7 @@ class Operation(BaseOperation):
                     if not messages_res["items"]:
                         break
 
+                    raw_items.extend(messages_res["items"])
                     last_message = messages_res["items"][-1]
                     for message in messages_res["items"]:
                         if not message.get("text"):
@@ -286,6 +297,12 @@ class Operation(BaseOperation):
 
                 if not last_message:
                     continue
+
+                # Пропускаем хвостовые служебные hh-вставки → берём последнее
+                # ЗНАЧИМОЕ сообщение (реальный вопрос работодателя), если оно есть.
+                last_message = self._pick_significant_message(
+                    raw_items, last_message
+                )
 
                 if self._should_reply(negotiation, last_message):
                     send_message = ""

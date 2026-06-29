@@ -13,6 +13,15 @@ profile:
   english: "C1"
   citizenship: "РФ"
 
+# Параметры прогона откликов (apply-slot).
+apply:
+  # Captcha circuit-breaker: если hh присылает капчу N раз ПОДРЯД (без единого
+  # успешного действия между ними) — аккаунт лимитируется, продолжать вредно.
+  # Прогон останавливается (exit 12), скрипт ставит короткую паузу. 0 = выключить.
+  captcha_circuit_breaker: 5
+  # Пауза после срабатывания (часы) — читается скриптом run-apply-dual.sh.
+  captcha_pause_hours: 2
+
 cover_letter:
   enabled: true
   # Агентная строка (2-й абзац) — статика, гарантированно в каждом письме.
@@ -138,6 +147,13 @@ reply:
     default: "senior Python backend разработчик (6+ лет), с опытом AI/LLM в проде"
     "060bb0abff103e7b970039ed1f783869335666": "senior Python backend разработчик (6+ лет коммерческого опыта на Python/FastAPI)"
     "c321ae99ff10b4bb2f0039ed1f515535474b79": "AI / LLM Engineer с сильным backend-фундаментом: RAG, агентные пайплайны (LangGraph/LangChain), LLM в проде, 6+ лет Python"
+  # Служебные hh-вставки (виджет «отзывы о работодателе»): hh добавляет их в чат
+  # как employer-сообщение ПОВЕРХ реального вопроса → pipeline эскалировал мусор.
+  # Эти regex (case-insensitive) → сообщение пропускается при выборе значимого и
+  # глушится (тишина). Привязка к уникальной фразе → near-zero false-positive.
+  service_message_patterns:
+    - "Изучите мнения тех, кто работал здесь"
+    - 'У работодателя\s+\d+\s+отзыв'
   classifier:
     provider: local                      # local = Ollama
     model: qwen2.5:14b-instruct          # не-thinking → нет бага #15260 (коллапс под format)
